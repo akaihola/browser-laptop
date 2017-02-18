@@ -52,57 +52,95 @@ const pickFields = (object, fields) => {
 }
 
 /**
- * Apply a bookmark or historySite SyncRecord to the browser data store.
- * @param {Object} record
+ * Apply bookmark or historySite SyncRecords to the browser data store.
+ * @param {Array.Object} records
  * @param {Immutable.Map} siteDetail
  */
-const applySiteRecord = (record) => {
+const applySiteRecords = (records) => {
   const appActions = require('../actions/appActions')
   const siteTags = require('../constants/siteTags')
-  const objectId = new Immutable.List(record.objectId)
-  const category = CATEGORY_MAP[record.objectData].categoryName
-  const existingObject = module.exports.getObjectById(objectId, category)
-  const existingObjectData = existingObject && existingObject[1]
-  let tag
 
-  let siteProps = Object.assign(
-    {},
-    existingObjectData && existingObjectData.toJS(),
-    record.historySite,
-    record.bookmark,
-    record.bookmark && record.bookmark.site,
-    {objectId}
-  )
-  if (record.objectData === 'bookmark') {
-    const existingFolderId = existingObjectData && existingObjectData.get('folderId')
-    if (existingFolderId) {
-      siteProps.folderId = existingFolderId
-    }
-    const isFolder = (typeof siteProps.isFolder === 'boolean')
-      ? siteProps.isFolder
-      : !!existingFolderId
-    tag = isFolder
-      ? siteTags.BOOKMARK_FOLDER
-      : siteTags.BOOKMARK
-    const parentFolderObjectId = siteProps.parentFolderObjectId
-    if (parentFolderObjectId && parentFolderObjectId.length > 0) {
-      siteProps.parentFolderId =
-        getFolderIdByObjectId(new Immutable.List(parentFolderObjectId))
-    }
-  }
-  const siteDetail = new Immutable.Map(pickFields(siteProps, SITE_FIELDS))
+  const batchedCreates = {} // map of tag to data
+  const updates = []
+  const deletes = []
 
-  switch (record.action) {
-    case writeActions.CREATE:
-      appActions.addSite(siteDetail, tag, undefined, undefined, true)
-      break
-    case writeActions.UPDATE:
-      appActions.addSite(siteDetail, tag, existingObjectData, null, true)
-      break
-    case writeActions.DELETE:
-      appActions.removeSite(siteDetail, tag, true)
-      break
+  records.forEach((record) => {
+    const objectId = new Immutable.List(record.objectId)
+    const category = CATEGORY_MAP[record.objectData].categoryName
+    const existingObject = module.exports.getObjectById(objectId, category)
+    const existingObjectData = existingObject && existingObject[1]
+    let tag
+
+    let siteProps = Object.assign(
+      {},
+      existingObjectData && existingObjectData.toJS(),
+      record.historySite,
+      record.bookmark,
+      record.bookmark && record.bookmark.site,
+      {objectId}
+    )
+    if (record.objectData === 'bookmark') {
+      const existingFolderId = existingObjectData && existingObjectData.get('folderId')
+      if (existingFolderId) {
+        siteProps.folderId = existingFolderId
+      }
+      const isFolder = (typeof siteProps.isFolder === 'boolean')
+        ? siteProps.isFolder
+        : !!existingFolderId
+      tag = isFolder
+        ? siteTags.BOOKMARK_FOLDER
+        : siteTags.BOOKMARK
+      const parentFolderObjectId = siteProps.parentFolderObjectId
+      if (parentFolderObjectId && parentFolderObjectId.length > 0) {
+        siteProps.parentFolderId =
+          getFolderIdByObjectId(new Immutable.List(parentFolderObjectId))
+      }
+    }
+    const siteDetail = new Immutable.Map(pickFields(siteProps, SITE_FIELDS))
+
+    switch (record.action) {
+      case writeActions.CREATE:
+        let key = tag || 'history'
+        if (batchedCreates[key]) {
+          batchedCreates[key].push(siteDetail)
+        } else {
+          batchedCreates[key] = [siteDetail]
+        }
+        break
+      case writeActions.UPDATE:
+        if (!existingObjectData) {
+          // Treat this as a create
+          let key = tag || 'history'
+          if (batchedCreates[key]) {
+            batchedCreates[key].push(siteDetail)
+          } else {
+            batchedCreates[key] = [siteDetail]
+          }
+        } else {
+          updates.push({siteDetail, existingObjectData, tag})
+        }
+        break
+      case writeActions.DELETE:
+        deletes.push({siteDetail, tag})
+        break
+    }
+  })
+
+  // Create all bookmarks in a batch
+  for (var tag in batchedCreates) {
+    appActions.addSite(new Immutable.List(batchedCreates[tag]), tag === 'history' ? undefined : tag,
+      undefined, undefined, true)
   }
+
+  // Apply updates
+  updates.forEach((update) => {
+    appActions.addSite(update.siteDetail, update.tag, update.existingObjectData, null, true)
+  })
+
+  // Apply deletes
+  deletes.forEach((deletion) => {
+    appActions.removeSite(deletion.siteDetail, deletion.tag, true)
+  })
 }
 
 const applySiteSettingRecord = (record) => {
@@ -167,7 +205,7 @@ const applySiteSettingRecord = (record) => {
  * Given a SyncRecord, apply it to the browser data store.
  * @param {Object} record
  */
-module.exports.applySyncRecord = (record) => {
+const applySyncRecord = (record) => {
   if (!record || !record.objectData) {
     console.log(`Warning: Can't apply empty record: ${record}`)
     return
@@ -175,7 +213,7 @@ module.exports.applySyncRecord = (record) => {
   switch (record.objectData) {
     case 'bookmark':
     case 'historySite':
-      applySiteRecord(record)
+      // these are handled in batches now
       break
     case 'siteSetting':
       applySiteSettingRecord(record)
@@ -194,10 +232,22 @@ module.exports.applySyncRecord = (record) => {
  */
 module.exports.applySyncRecords = (records) => {
   if (!records || records.length === 0) { return }
+  const siteRecords = []
+  const otherRecords = []
+  records.forEach((record) => {
+    if (record && ['bookmark', 'historySite'].includes(record.objectData)) {
+      siteRecords.push(record)
+    } else {
+      otherRecords.push(record)
+    }
+  })
   setImmediate(() => {
-    const record = records.shift()
-    module.exports.applySyncRecord(record)
-    module.exports.applySyncRecords(records)
+    const record = otherRecords.shift()
+    applySyncRecord(record)
+    module.exports.applySyncRecords(otherRecords)
+  })
+  setImmediate(() => {
+    applySiteRecords(siteRecords)
   })
 }
 
