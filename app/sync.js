@@ -363,7 +363,6 @@ module.exports.init = function (initialState) {
         }
       }
     }
-    syncUtil.applySyncRecords(records)
   })
 }
 
